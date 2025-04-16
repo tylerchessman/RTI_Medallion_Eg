@@ -1,4 +1,4 @@
-# RTI_Medallion_Eg
+# Medallion Architecture in Fabric Real-Time Intelligence (RTI)
 Example implementation of a Medallion architecture in Fabric RTI - using Azure SQL DB CDC Events as a source
 
 ## Summary
