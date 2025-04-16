@@ -1,0 +1,202 @@
+//    *****Fabric RTI - Medallion Architecture******
+
+//    In this example, we use CDC Events from the AdventureWorksLT sample database to simulate the streaming of Sales Orders into a EventHouse (KQL) database
+//          This sample focuses on two tables - SalesOrderHeader and SalesOrderDetail.  
+//          Database rows will be inserted, updated, and deleted; KQL tables, materialized views, and views will be used to store, dedup, and present the latest Sales Order information
+
+// Streaming/Ingestion
+//      An EventStream is used to connect to to an Azure SQL DB with the AdventureWorksLT database.  CDC has been enabled in this database, and the EventStream is configured to push events into a Bronze Layer
+
+// Bronze (Raw) layer.
+//      We've defined a table (rawCDCEvents) to capture CDC events from both tables.  Note, in a production environment, you could choose to filter/push the raw events into multiple tables.
+rawCDCEvents
+| take 5;
+
+// Silver layer
+//      We create two tables to store the events for each respective table
+//      For a list of supported data types, see https://learn.microsoft.com/en-us/kusto/query/scalar-data-types/?view=microsoft-fabric
+.create table silverSalesOrderHeader (op:string, SalesOrderID:int, RevisionNumber:int, OrderDate:datetime, DueDate:datetime, ShipDate:datetime, Status:int, OnlineOrderFlag:bool,
+                                   CustomerID:int, ShipToAddressID:int, Comment:string, ModifiedDate:datetime, IngestedAt:datetime);
+
+.create table silverSalesOrderDetail (op:string, SalesOrderID:int, SalesOrderDetailID:int, ProductID:int, OrderQty:int, UnitPrice:real, ModifiedDate:datetime, IngestedAt:datetime);
+
+// note: if re-running this demo script, clear out the silver tables if desired
+//.clear table silverSalesOrderHeader data;
+//.clear table silverSalesOrderDetail data;
+//.clear materialized-view  mvSalesOrderHeader data;
+//.clear materialized-view  mvSalesOrderDetail data;
+
+// here is a test query to extract SalesOrderHeader into the silver Table.
+//      We inspect the payload.op to determine if this is a create, update, or delete event - and then read from the appropriate payload
+rawCDCEvents
+| where tostring(payload.source.table) == "SalesOrderHeader"
+| extend IngestedAt = ingestion_time()
+| extend op = tostring(payload.op)
+| extend columns = iif(op == "d", payload.before, payload.after)
+| extend SalesOrderID = toint(columns.SalesOrderID), RevisionNumber = toint(columns.RevisionNumber),
+         OrderDate = unixtime_milliseconds_todatetime(tolong(columns.OrderDate)), DueDate = unixtime_milliseconds_todatetime(tolong(columns.DueDate)), 
+         ShipDate = unixtime_milliseconds_todatetime(tolong(columns.ShipDate)), Status = toint(columns.Status),
+         OnlineOrderFlag = tobool(columns.OnlineOrderFlag), CustomerID = toint(columns.CustomerID), ShipToAddressID = toint(columns.ShipToAddressID),
+         Comment =  tostring(columns.Comment), ModifiedDate = unixtime_milliseconds_todatetime(tolong(columns.ModifiedDate))
+| project op, SalesOrderID, RevisionNumber, OrderDate, DueDate, ShipDate, Status, OnlineOrderFlag, CustomerID, ShipToAddressID, Comment, ModifiedDate, IngestedAt;
+
+
+// ...and now a query to extract SalesOrderDetail into a Silver Table
+//      Note: handling SQL Money data types takes a bit of extra effor for the time being, as it comes over base64 encoded.
+rawCDCEvents
+| where tostring(payload.source.table) == "SalesOrderDetail"
+| extend IngestedAt = ingestion_time()
+| extend op = tostring(payload.op)
+| extend columns = iif(op == "d", payload.before, payload.after)
+| extend UnitPriceRaw = tostring(columns.UnitPrice)
+| extend UnitPriceArray = base64_decode_toarray(UnitPriceRaw)
+| extend UnitPriceByteCount = array_length(UnitPriceArray)
+| mv-expand UnitPriceByteIndex = range(0, UnitPriceByteCount-1)  // Expand to iterate over each byte
+| extend ByteValue = tolong(UnitPriceArray[toint(UnitPriceByteIndex)]) * pow(256, UnitPriceByteCount - 1 - toint(UnitPriceByteIndex))
+| summarize UnitPriceInteger = sum(ByteValue) by op = tostring(payload.op), 
+          SalesOrderDetailID = toint(columns.SalesOrderDetailID), 
+          SalesOrderID = toint(columns.SalesOrderID),   
+          ProductID = toint(columns.ProductID),
+          OrderQty = toint(columns.OrderQty),
+        //  UnitPriceStr = UnitPriceRaw,    
+        //  UnitPriceAsArray = tostring(UnitPriceArray),
+          ModifiedDate = unixtime_milliseconds_todatetime(tolong(columns.ModifiedDate)),
+          IngestedAt = IngestedAt
+| extend UnitPrice = toreal(UnitPriceInteger) / 10000.0  // Convert from MONEY integer format
+| project op, SalesOrderID, SalesOrderDetailID, ProductID, OrderQty, UnitPrice, ModifiedDate, IngestedAt;
+
+// With these two queries, we can now create a table update policy to populate the silverSalesOrderHeader and silverSalesOrderDetail table.
+//  First, we define functions that encapsulate our working queries
+.create-or-alter function TransformSalesOrderHeaderToSilver() {
+rawCDCEvents
+| where tostring(payload.source.table) == "SalesOrderHeader"
+| extend IngestedAt = ingestion_time()
+| extend op = tostring(payload.op)
+| extend columns = iif(op == "d", payload.before, payload.after)
+| extend ModifiedDate = iif(op == "d", IngestedAt, unixtime_milliseconds_todatetime(tolong(columns.ModifiedDate)))
+| extend SalesOrderID = toint(columns.SalesOrderID), RevisionNumber = toint(columns.RevisionNumber),
+         OrderDate = unixtime_milliseconds_todatetime(tolong(columns.OrderDate)), DueDate = unixtime_milliseconds_todatetime(tolong(columns.DueDate)), 
+         ShipDate = unixtime_milliseconds_todatetime(tolong(columns.ShipDate)), Status = toint(columns.Status),
+         OnlineOrderFlag = tobool(columns.OnlineOrderFlag), CustomerID = toint(columns.CustomerID), ShipToAddressID = toint(columns.ShipToAddressID),
+         Comment =  tostring(columns.Comment), ModifiedDate = ModifiedDate // unixtime_milliseconds_todatetime(tolong(columns.ModifiedDate))
+| project op, SalesOrderID, RevisionNumber, OrderDate, DueDate, ShipDate, Status, OnlineOrderFlag, CustomerID, ShipToAddressID, Comment, ModifiedDate, IngestedAt;
+}
+
+.create-or-alter function TransformSalesOrderDetailToSilver() {
+rawCDCEvents
+| where tostring(payload.source.table) == "SalesOrderDetail"
+| extend IngestedAt = ingestion_time()
+| extend op = tostring(payload.op)
+| extend columns = iif(op == "d", payload.before, payload.after)
+| extend ModifiedDate = iif(op == "d", IngestedAt, unixtime_milliseconds_todatetime(tolong(columns.ModifiedDate)))
+| extend UnitPriceRaw = tostring(columns.UnitPrice)
+| extend UnitPriceArray = base64_decode_toarray(UnitPriceRaw)
+| extend UnitPriceByteCount = array_length(UnitPriceArray)
+| mv-expand UnitPriceByteIndex = range(0, UnitPriceByteCount-1)  // Expand to iterate over each byte
+| extend ByteValue = tolong(UnitPriceArray[toint(UnitPriceByteIndex)]) * pow(256, UnitPriceByteCount - 1 - toint(UnitPriceByteIndex))
+| summarize UnitPriceInteger = sum(ByteValue) by op = tostring(payload.op), 
+          SalesOrderDetailID = toint(columns.SalesOrderDetailID), 
+          SalesOrderID = toint(columns.SalesOrderID),   
+          ProductID = toint(columns.ProductID),
+          OrderQty = toint(columns.OrderQty),
+        //  UnitPriceStr = UnitPriceRaw,    
+        //  UnitPriceAsArray = tostring(UnitPriceArray),
+          ModifiedDate = ModifiedDate, // unixtime_milliseconds_todatetime(tolong(columns.ModifiedDate)),
+          IngestedAt = IngestedAt
+| extend UnitPrice = toreal(UnitPriceInteger) / 10000.0  // Convert from MONEY integer format
+| project op, SalesOrderID, SalesOrderDetailID, ProductID, OrderQty, UnitPrice, ModifiedDate, IngestedAt;
+}
+
+// Now, we create an update policy on each table
+.alter table silverSalesOrderHeader policy update
+```[{
+    "IsEnabled": true,
+    "Source": "rawCDCEvents",
+    "Query": "TransformSalesOrderHeaderToSilver()",
+    "IsTransactional": false,
+    "PropagateIngestionProperties": false
+}]```
+
+.alter table silverSalesOrderDetail policy update
+```[{
+    "IsEnabled": true,
+    "Source": "rawCDCEvents",
+    "Query": "TransformSalesOrderDetailToSilver()",
+    "IsTransactional": false,
+    "PropagateIngestionProperties": false
+}]```
+
+// Over in SSMS, we can run the script 01_NewOrders.sql to generate some CDC events - and then query our tables
+--
+explain
+SELECT * FROM silverSalesOrderHeader WHERE IngestedAt > DATEADD(minute, -15, getdate()) order by SalesOrderID, ModifiedDate;
+
+
+silverSalesOrderHeader
+| where (IngestedAt > datetime_add("minute", int(-15), now()))
+| project op, SalesOrderID, RevisionNumber, OrderDate, DueDate, ShipDate, Status, OnlineOrderFlag, CustomerID, ShipToAddressID, Comment, ModifiedDate, IngestedAt
+| sort by SalesOrderID asc nulls first, ModifiedDate asc nulls first;
+
+silverSalesOrderDetail
+| where (IngestedAt > datetime_add("minute", int(-15), now()))
+| sort by SalesOrderID asc nulls first, SalesOrderDetailID asc nulls first, ModifiedDate asc;
+
+// Silver layer (Part II - Dedup View)
+//  silverSalesOrderHeader and silverSalesOrderDetail contain a "running history" of all events for a Sales Order.
+//    We will use a Materialized View to dedup each table - producing a deduplicated, persisted view.
+//.drop materialized-view mvSalesOrderHeader
+//.drop materialized-view mvSalesOrderDetail
+.create async materialized-view with (backfill=true) mvSalesOrderHeader  on table silverSalesOrderHeader
+{
+    silverSalesOrderHeader
+    | summarize arg_max(ModifiedDate, *) by SalesOrderID
+}
+
+.create async materialized-view with (backfill=true) mvSalesOrderDetail  on table silverSalesOrderDetail
+{
+    silverSalesOrderDetail
+    | summarize arg_max(ModifiedDate, *) by SalesOrderID, SalesOrderDetailID
+}
+
+mvSalesOrderHeader
+| sort by SalesOrderID asc
+| where (IngestedAt > datetime_add("minute", int(-15), now()))
+| take 5;
+
+mvSalesOrderDetail
+| sort by SalesOrderID asc, SalesOrderDetailID asc
+| where (IngestedAt > datetime_add("minute", int(-15), now()))
+| take 10;
+
+// Gold Layer - We can join/denormalize these two tables with a View - this will provide the latest values for a sales order , and we can optionally remove any deleted items
+--
+explain
+SELECT SOD.op, SOH.SalesOrderID, SOH.RevisionNumber, SOH.OrderDate, SOH.DueDate, SOH.ShipDate, SOH.Status, SOH.OnlineOrderFlag, SOH.CustomerID, SOH.ShipToAddressID, SOH.Comment, 
+       SOD.SalesOrderDetailID, SOD.ProductID, SOD.OrderQty, SOD.UnitPrice, (SOD.OrderQty * SOD.UnitPrice) AS LineItemTotal, SOD.ModifiedDate, SOD.IngestedAt
+FROM   mvSalesOrderDetail SOD INNER JOIN mvSalesOrderHeader SOH ON SOD.SalesOrderID = SOH.SalesOrderID
+WHERE  SOD.op <> 'd';
+
+mvSalesOrderDetail
+| join kind=inner 
+(mvSalesOrderHeader
+| project-rename ['SOH.SalesOrderID']=SalesOrderID, ['SOH.ModifiedDate']=ModifiedDate, ['SOH.op']=op, ['SOH.IngestedAt']=IngestedAt) on ($left.SalesOrderID == $right.['SOH.SalesOrderID'])
+| where (op != "d")
+| project op, ['SOH.SalesOrderID'], RevisionNumber, OrderDate, DueDate, ShipDate, Status, OnlineOrderFlag, CustomerID, ShipToAddressID, Comment, SalesOrderDetailID, ProductID, OrderQty, UnitPrice, LineItemTotal=__sql_multiply(todouble(OrderQty), UnitPrice), ModifiedDate, IngestedAt
+| project-rename SalesOrderID=['SOH.SalesOrderID'];
+
+// We can save this view for downstream clients
+.create-or-alter function
+    with (view=true) 
+    vwSalesOrder() { mvSalesOrderDetail
+| join kind=inner 
+(mvSalesOrderHeader
+| project-rename ['SOH.SalesOrderID']=SalesOrderID, ['SOH.ModifiedDate']=ModifiedDate, ['SOH.op']=op, ['SOH.IngestedAt']=IngestedAt) on ($left.SalesOrderID == $right.['SOH.SalesOrderID'])
+| where (op != "d")
+| project op, ['SOH.SalesOrderID'], RevisionNumber, OrderDate, DueDate, ShipDate, Status, OnlineOrderFlag, CustomerID, 
+    ShipToAddressID, Comment, SalesOrderDetailID, ProductID, OrderQty, UnitPrice, LineItemTotal=OrderQty * UnitPrice, ModifiedDate, IngestedAt
+| project-rename SalesOrderID=['SOH.SalesOrderID'] }
+
+vwSalesOrder
+| sort by SalesOrderID, SalesOrderDetailID
+| where (IngestedAt > datetime_add("minute", int(-15), now()))
+| take 10
