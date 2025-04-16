@@ -10,4 +10,4 @@ To implement this example in your own environment, get started by creating the A
 You’ll also need access to a [workspace](https://learn.microsoft.com/en-us/fabric/fundamentals/workspaces) associated to a Fabric-enabled capacity.  Depending on your environment, you may be able to use a [trial](https://learn.microsoft.com/en-us/fabric/fundamentals/fabric-trial) if an existing capacity is not available.
 
 ## Walkthrough
-The rest of the documentation is located in the pdf file RTI_MedallionArch_TransactionData.
+The rest of the documentation is located in the file RTI_MedallionArch_TransactionData.pdf.
